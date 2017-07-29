@@ -1,0 +1,8 @@
+please FLASH the TM4C1294XL folder code to TM4C1294XL microcontroller
+connect microcontroller to router by using LAN cable,connect power source to microcontroller
+login to ti.exosite.com - assign the MAC addres of the microcontroller and create the datasource -LED1
+swich on the datasource you created in Dashboard UI
+Flash the code in folder BLE112A to master and slave bluetooth modules
+connect the GPIO P1.1 of microcontroller to p1.5,p0.5 of bluetooth module BLE112A-MASTER,connect the ground pin of microcontroller to BLE112A
+
+connect the slave BLE module to relay,output of relay should be given to Induction stove circuitry
