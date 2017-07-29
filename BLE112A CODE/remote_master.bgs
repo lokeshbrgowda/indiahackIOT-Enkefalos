@@ -1,0 +1,193 @@
+const PIN_SELECT_MASK = $FF         # 0b11111111 = Px_0-Px_7 are outputs
+#const PIN_SELECT_MASK = $E0         # 0b11100000 = Px_5/6/7 are outputs
+
+const STATE_STANDBY = 0
+const STATE_SCANNING = 1
+const STATE_CONNECTING = 2
+const STATE_FINDING_SERVICES = 3
+const STATE_FINDING_ATTRIBUTES = 4
+const STATE_CONTROL_READY = 5
+
+dim app_state                       # keep track of application state
+
+dim pending_connection_handle       # handle for pending connection attempt
+
+dim att_handlesearch_start          # GPIO remote GATT service definition range handle start
+dim att_handlesearch_end            # GPIO remote GATT service definition range handle end
+dim att_handle_gpio_control         # local var for discovering/storing remote handle
+
+dim ad_field_length
+dim ad_field_type
+
+dim i
+dim j
+dim k
+dim ret_result
+dim temp_buf(16)
+
+event system_boot(major, minor, patch, build, ll_version, protocol_version, hw)
+    # initialize all status/tracking vars
+    app_state = STATE_STANDBY
+    pending_connection_handle = $ff
+    att_handlesearch_start = 0
+    att_handlesearch_end = 0
+    att_handle_gpio_control = 0
+    
+    # enable falling-edge interrupts on Port0 pins
+    call hardware_io_port_config_pull(0, $00, 0)
+    call hardware_io_port_irq_enable(0, PIN_SELECT_MASK)
+    call hardware_io_port_irq_direction(0, 1)
+
+    # enable rising-edge interrupts on Port1 pins
+    # (dual-pin connections allows CHANGE-style interrupts)
+    call hardware_io_port_config_pull(1, $00, 0)
+    call hardware_io_port_irq_enable(1, PIN_SELECT_MASK)
+    call hardware_io_port_irq_direction(1, 0)
+    
+    # set scan parameters to 125ms/125ms interval/window, and use passive scanning
+    call gap_set_scan_parameters(200, 200, 0)
+
+    # start discovery
+    app_state = STATE_SCANNING
+    call gap_discover(gap_discover_generic)
+end
+
+# catch scan response event while scanning
+event gap_scan_response(rssi, packet_type, sender, address_type, bond, data_len, data_data)
+    # only check for main ad packets (packet_type = 0)
+    if packet_type = 0 then
+        # advertisement packet found during scan, so check for demo status/control service
+        # searched UUID is defined in the slave GATT as 47f1de41-c535-414f-a747-1184246636c6
+        # NOTE: LITTLE-ENDIAN BYTE ORDER
+        temp_buf(0:16) = "\xc6\x36\x66\x24\x84\x11\x47\xa7\x4f\x41\x35\xc5\x41\xde\xf1\x47"
+
+        i = 0
+        while i < data_len
+            ad_field_length = data_data(i:1)
+            ad_field_type = data_data(i + 1:1)
+            if ad_field_type = $06 || ad_field_type = $07 then
+                # partial ($06) or complete ($07) list of 128-bit UUIDs
+
+                j = 0
+                while j < ad_field_length - 1
+                    if memcmp(data_data(i + j + 2), temp_buf(0), 16) && app_state = STATE_SCANNING then
+                        # found GPIO remote service, so connect (stops scanning automatically)
+                        call gap_connect_direct(sender(0:6), address_type, $20, $30, 100, 0)(ret_result, k)
+                        pending_connection_handle = k
+
+                        # update application state
+                        app_state = STATE_CONNECTING
+
+                        # start 4-second one-shot timer to detect connection timeout
+                        call hardware_set_soft_timer(32768*4, 0, 1)
+                        
+                        # exit gap_scan_response event handler immediately
+                        return
+                    end if
+                    j = j + 16
+                end while
+            end if
+            i = i + ad_field_length + 1
+        end while
+    end if
+end
+
+# catch connection update event
+event connection_status(connection, flags, address, address_type, conn_interval, timeout, latency, bonding)
+    # check for "new connection established" update
+    if (flags & $05) = $05 then
+        # make sure this is the first "connection_update" event
+        # (may be triggered again for other updates, encryption, etc.)
+        if app_state = STATE_CONNECTING then
+            # cancel connection timeout timer
+            call hardware_set_soft_timer(0, 0, 1)
+            pending_connection_handle = $ff
+
+            # start searching through service groups (UUID = 0x2800) to find GPIO remote service
+            call attclient_read_by_group_type(connection, $0001, $ffff, 2, "\x00\x28")
+
+            # update application state
+            app_state = STATE_FINDING_SERVICES
+        end if
+    end if
+end
+
+# catch group found event (during GATT service discovery)
+event attclient_group_found(connection, start_handle, end_handle, uuid_len, uuid_data)
+    # found a service group, so check to see if it's the GPIO remote service
+    # searched UUID is defined in the slave GATT as 47f1de41-c535-414f-a747-1184246636c6
+    # ^^^ NOTE: "temp_buf" will still contain this value from the GAP device scan earlier
+    if uuid_len = 16 && memcmp(uuid_data(0), temp_buf(0), 16) then
+        # found it! save the handle range
+        att_handlesearch_start = start_handle
+        att_handlesearch_end = end_handle
+    end if
+end
+
+event attclient_find_information_found(connection, chrhandle, uuid_len, uuid_data)
+    # found a descriptor, so check to see if it's the the right one
+    # ^^^ NOTE: "temp_buf" will contain the correct value for this search, having been written
+    #           in the "attclient_procedure_completed" handler before starting the search
+    if uuid_len = 16 && memcmp(uuid_data(0), temp_buf(0), 16) then
+        # found the GPIO control attribute, so save the handle
+        att_handle_gpio_control = chrhandle
+    end if
+end
+
+# catch procedure completed event (during GATT discovery and upon write acknowledgement)
+event attclient_procedure_completed(connection, result, chrhandle)
+    if app_state = STATE_FINDING_SERVICES then
+        # just finished scanning for services
+        if att_handlesearch_start > 0 then
+            # found GPIO remote service, so now find the control characteristic value handle
+            temp_buf(0:16) = "\xe7\xa9\x1e\x26\xbc\x50\x93\x84\x4a\x4b\xc0\x06\xc7\xb6\x08\xf4"
+            call attclient_find_information(0, att_handlesearch_start, att_handlesearch_end)
+
+            # update application state
+            app_state = STATE_FINDING_ATTRIBUTES
+        #else
+            # if the "else" matches, we didn't find the service...uh oh
+        end if
+    else
+        if app_state = STATE_FINDING_ATTRIBUTES then
+            # just finished scanning for attributes_read
+            if att_handle_gpio_control > 0 then
+                app_state = STATE_CONTROL_READY
+            #else
+                # if the "else" matches, we didn't find the control attribute...uh oh
+            end if
+        #else
+            # just acknowledged a GATT write operation from a GPIO logic change
+            # (not important for this example)
+        end if
+    end if
+end
+
+# catch disconnection event
+event connection_disconnected(handle, result)
+    # restart discovery
+    app_state = STATE_SCANNING
+    call gap_discover(gap_discover_generic)
+end
+
+# catch timer tick (used to update the slave and detect connection attempt timeouts)
+event hardware_soft_timer(handle)
+    if app_state = STATE_CONNECTING && pending_connection_handle != $ff then
+        # end connection attempt (1st line required, 2nd line failsafe)
+        call gap_end_procedure()
+        call connection_disconnect(pending_connection_handle)
+            
+        # restart discovery
+        app_state = STATE_SCANNING
+        call gap_discover(gap_discover_generic)
+    end if
+end
+
+# catch GPIO interrupts to pass on logic states to the slave
+event hardware_io_port_status(timestamp, port, irq, state)
+    if app_state = STATE_CONTROL_READY then
+        # connected, so write new GPIO port bitmask value to remote device
+        call attclient_attribute_write(0, att_handle_gpio_control, 1, state)
+    end if
+end
+

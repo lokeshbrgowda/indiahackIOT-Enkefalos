@@ -1,0 +1,36 @@
+
+const PIN_SELECT_MASK = $FF         # 0b11111111 = Px_0-Px_7 are outputs
+#const PIN_SELECT_MASK = $E0         # 0b11100000 = Px_5/6/7 are outputs
+
+event system_boot(major, minor, patch, build, ll_version, protocol_version, hw)
+    # set desired Port1 pins to output/low mode
+    call hardware_io_port_config_direction(1, PIN_SELECT_MASK)
+    call hardware_io_port_write(1, PIN_SELECT_MASK, $00)
+    
+    # set advertisement interval to 200-300ms
+    call gap_set_adv_parameters(320, 480, 7)
+
+    # put module into discoverable/connectable mode
+    call gap_set_mode(gap_general_discoverable, gap_undirected_connectable)
+end
+
+# catch connection update event
+#event connection_status(connection, flags, address, address_type, conn_interval, timeout, latency, bonding)
+    # the slave side does not care about connection details,
+    # but this event handler is left here for convenience in
+    # case additional functionality is needed
+#end
+
+# catch disconnection event
+event connection_disconnected(handle, result)
+    # put module back into discoverable/connectable mode
+    call gap_set_mode(gap_general_discoverable, gap_undirected_connectable)
+end
+
+# catch remote write of characteristic value
+event attributes_value(connection, reason, handle, offset, value_len, value_data)
+    if handle = c_gpio_levels then
+        # write single byte to Port1 (masked by output pin selection value)
+        call hardware_io_port_write(1, PIN_SELECT_MASK, value_data(0:1))
+    end if
+end
